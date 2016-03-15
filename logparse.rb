@@ -1,4 +1,6 @@
 #!/usr/bin/env ruby
+# FIXME:
+# skip values on the border of buffer
 
 require 'time'
 
@@ -11,7 +13,7 @@ class LogParser
     raise ArgumentError unless File.exists?(log_path)
 
     @log = File.open(log_path, 'r')
-    @hours = hours.to_i
+    @hours = hours.to_f
     @buffer_size = TAIL_BUF_LENGTH
     @stats = {
       :db_count => 0,
@@ -23,7 +25,7 @@ class LogParser
     delta = @hours/24.0
     ts_stop = (DateTime.now - delta).to_time
 
-    # we start at the end
+    # we start from the end
     @log.seek(0, IO::SEEK_END)
     offset = @log.pos
     stop_flag = false
@@ -71,8 +73,10 @@ class LogParser
 
   def calc(data)
     db_delays = data.scan(DB_DELAY_RE).collect{|i| i[0].to_f}
+    return if db_delays.length == 0
+
     @stats[:db_count] += db_delays.length
-    @stats[:db_avg_delay] = (@stats[:db_avg_delay] + db_delays.reduce(:+).to_f / db_delays.size) / 2.0
+    @stats[:db_avg_delay] = (@stats[:db_avg_delay] + db_delays.reduce(:+).to_f / db_delays.length) / 2.0
   end
 
 end
@@ -80,5 +84,4 @@ end
 if __FILE__ == $0
   parser = LogParser.new(*ARGV)
   parser.process()
-
 end
