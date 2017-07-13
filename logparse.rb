@@ -1,33 +1,106 @@
 #!/usr/bin/env ruby
 
-require 'time'
+require 'optparse'
+require 'digest'
+require 'yaml'
 
-TAIL_BUF_LENGTH = 2 ** 13 # 8192
+CHUNK_SIZE = 2 ** 13 # 8192
 TS_RE = /\w{2} \w{3} \d{4} \d{2}:\d{2}:\d{2} \w{3}/
-DB_DELAY_RE = /nd-db:time.*([0-9]+\.[0-9]*)ms/
+MEM_RE = /(noodoo:memory.*worker \(([0-9])\:.*)/
+MEM_RSS_RE = /rss: ([0-9]+)/
+MEM_HEAP_TOTAL_RE = /heapTotal: ([0-9]+)/
+MEM_HEAP_USED_RE = /heapUsed: ([0-9]+)/
+CACHE_TTL = 55
+
+def main
+  argv = {}
+  OptionParser.new do |opts|
+    opts.banner = "Usage: #{$0} [options]"
+
+    opts.on("-f", "--logfile path", String, "Log file path") do |p|
+      argv[:file] = p
+    end
+
+    opts.on("-i", "--worker id", Integer, "Worker ID") do |p|
+      argv[:id] = p
+    end
+
+    opts.on("-k", "--key keyname", String, "Return specific key value") do |p|
+      argv[:key] = p
+    end
+  end.parse!
+  raise OptionParser::MissingArgument if argv[:file].nil?
+
+  stats = {}
+  first_run = false
+  md5 = Digest::MD5.new
+  stats_fname = File.join('/tmp',
+    File.basename($0, '.rb') + '-' + md5.hexdigest(argv[:file]) + '.yaml')
+
+  save_stats = ->() {
+    # if first_run
+    #   stats[:last_read_pos] = 0
+    # else
+    #   stats[:last_read_pos] = File.size(argv[:file])
+    # end
+    File.open(stats_fname, 'w') { |f| YAML.dump(stats, f) }
+  }
+
+  if !File.file?(stats_fname)
+    first_run = true
+    stats[:last_read_pos] = 0
+    save_stats.call()
+  end
+
+  old_stats = YAML.load_file(stats_fname)
+
+  if !first_run && File.mtime(stats_fname) + CACHE_TTL > DateTime.now.to_time
+    stats = old_stats
+  else
+    parser = LogParser.new(argv[:file], stats)
+    new_stats = parser.process(old_stats[:last_read_pos].to_i)
+    
+    # new_stats[:workers].each do |key, val|
+    #   old_stats[key] = val
+    # end
+    
+    # old_stats[:last_read_pos] = new_stats[:last_read_pos]
+
+    p old_stats
+
+    stats = old_stats
+
+    save_stats.call()
+  end
+
+  if argv[:id] then
+    stats = stats[:workers][argv[:id]]
+    stats = stats[argv[:key].to_sym] if argv[:key]
+  end
+
+  puts stats
+end
+
 
 class LogParser
   def initialize(log_path)
     raise ArgumentError unless File.exists?(log_path)
 
     @log = File.open(log_path, 'r')
-    @buffer_size = TAIL_BUF_LENGTH
+    @buffer_size = CHUNK_SIZE
     @stats = {
-      db_count: 0,
-      db_avg_delay: 0
+      workers: {}
     }
   end
 
-  def process(hours)
-    delta = hours.to_f/24.0
-    ts_stop = (DateTime.now - delta).to_time
-
-    # starting from the end
+  def process(start_pos)
+    # starting from the end, file is constantly growing
     @log.seek(0, IO::SEEK_END)
+    @stats[:last_read_pos] = @log.pos #File.size(argv[:file])
+
     offset = @log.pos
     stop_flag = false
-    data_tail = nil
-    while offset > 0 && !stop_flag
+    while offset > start_pos && !stop_flag
       if (offset - @buffer_size) < 0
         to_read = offset
       else
@@ -38,54 +111,33 @@ class LogParser
       data = @log.read(to_read)
       offset -= data.length
 
-      data = data + data_tail if data_tail
-
-      last_ts_str = data[TS_RE] # first ts
-      data_tail = nil
-      if last_ts_str
-        data_tail = data[0 ... data.index(last_ts_str)]
-        last_ts = Time.parse(last_ts_str)
-      end
-
-      # the end of the tail
-      if last_ts && last_ts < ts_stop
-        # find the stop position
-        stop_flag = true;
-        match_arr = data.scan(TS_RE)
-        part_data = ''
-        for i in 0 ... match_arr.size
-          ts = Time.parse(match_arr[i])
-          if (ts > ts_stop)
-            stop_pos = data.index(match_arr[i])
-            part_data = data.slice(stop_pos, data.length)
-            break
-          end
-        end
-        data = part_data
-      end
-
-      self.calc(data)
+      self.calc(data, stop_flag)
     end
 
-    # result output
-    # @log.seek(offset)
-    # return data = @log.read
-    puts 'Results:'
-    puts "db_records_found\t#{@stats[:db_count]}"
-    puts "db_avg_delay\t#{@stats[:db_avg_delay]}"
+    # @stats[]
+    return @stats
   end
 
-  def calc(data)
-    db_delays = data.scan(DB_DELAY_RE).collect{|i| i[0].to_f}
-    return if db_delays.length == 0
-
-    @stats[:db_count] += db_delays.length
-    @stats[:db_avg_delay] = (@stats[:db_avg_delay] + db_delays.reduce(:+).to_f / db_delays.length) / 2.0
+  def calc(data, stop_flag)
+    log_items = data.scan(MEM_RE)
+    
+    log_items.each do |log_item|
+      str = log_item[0]
+      id = log_item[1].to_i
+      
+      rss = str[MEM_RSS_RE, 1].to_i
+      heap_total = str[MEM_HEAP_TOTAL_RE, 1].to_i
+      heap_used = str[MEM_HEAP_USED_RE, 1].to_i
+      
+      @stats[:workers][id] = {
+        rss: rss,
+        heapTotal: heap_total,
+        heapUsed: heap_used
+      }
+    end
+    
+    #stop_flag = true
   end
-
 end
 
-if __FILE__ == $0
-  parser = LogParser.new(ARGV[0])
-  parser.process(ARGV[1])
-end
+main
